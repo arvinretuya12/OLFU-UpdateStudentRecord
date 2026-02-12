@@ -1,0 +1,11 @@
+{
+    "require": {
+        "google/apiclient": "^2.15",
+        "phpoffice/phpspreadsheet": "^2.1"
+    },
+    "config": {
+        "allow-plugins": {
+            "php-http/discovery": true
+        }
+    }
+}
