@@ -88,7 +88,7 @@
 </div>
 
 <footer>
-    Developed by AJ Retuya &copy; 2026 version 1.0
+    Developed by AJ Retuya &copy; 2026 version 1.1
 </footer>
 
 <script>
