@@ -90,8 +90,12 @@ try {
     
     $sheetId = getSheetIdByName($service, $spreadsheetId, $targetSheetName);
 
+    $structureRequests = [];
+    $addedStudents = [];
+
     echo "<div style='font-family:monospace; background:#f4f4f4; padding:15px; border-radius:5px;'>";
 
+    // --- PHASE 1: QUEUE THE CHANGES ---
     foreach ($excelNames as $excelName) {
         
         while (isset($gsheetNames[$sheetRowIndex]) && $gsheetNames[$sheetRowIndex] === '') {
@@ -105,28 +109,118 @@ try {
             $sheetRowIndex++;     
             $physicalRowPointer++; 
         } else {
-            echo "INSERTING: <strong>$excelName</strong> at row " . ($physicalRowPointer) . "<br>";
+            echo "QUEUEING: <strong>$excelName</strong> at row " . ($physicalRowPointer) . "<br>";
             
             $newRowIndex = $physicalRowPointer - 1; // 0-based index for API
 
-            // A. Insert Empty Row
-            insertRow($service, $spreadsheetId, $sheetId, $newRowIndex);
+            // Queue A: Insert Empty Row
+            $structureRequests[] = [
+                'insertDimension' => [
+                    'range' => [
+                        'sheetId' => $sheetId,
+                        'dimension' => 'ROWS',
+                        'startIndex' => $newRowIndex, 
+                        'endIndex' => $newRowIndex + 1
+                    ],
+                    'inheritFromBefore' => false 
+                ]
+            ];
             
-            // B. Full Copy from Neighbor (Formula + Format + Values)
-            // This forces Google to auto-increment the formula references (C5 -> C6)
+            // Queue B: Copy Formulas & Formatting
             $sourceRowIndex = ($newRowIndex > 5) ? ($newRowIndex - 1) : ($newRowIndex + 1);
-            copyFullRow($service, $spreadsheetId, $sheetId, $sourceRowIndex, $newRowIndex);
+            $structureRequests[] = [
+                'copyPaste' => [
+                    'source' => [
+                        'sheetId' => $sheetId,
+                        'startRowIndex' => $sourceRowIndex,
+                        'endRowIndex' => $sourceRowIndex + 1,
+                    ],
+                    'destination' => [
+                        'sheetId' => $sheetId,
+                        'startRowIndex' => $newRowIndex,
+                        'endRowIndex' => $newRowIndex + 1,
+                    ],
+                    'pasteType' => 'PASTE_NORMAL' 
+                ]
+            ];
             
-            // C. Sanitize the New Row 
-            // Read the row we just filled, keep formulas, delete hardcoded values
-            sanitizeRow($service, $spreadsheetId, $targetSheetName, $physicalRowPointer);
-
-            // D. Overwrite Name (Column B)
-            writeCell($service, $spreadsheetId, $targetSheetName, $physicalRowPointer, $excelName);
+            // Track the student for the value sanitization phase
+            $addedStudents[] = [
+                'name' => $excelName,
+                'rowNumber' => $physicalRowPointer
+            ];
 
             $physicalRowPointer++;
         }
     }
+
+    // --- PHASE 2: BATCH EXECUTE ROW STRUCTURE (1 API CALL) ---
+    if (!empty($structureRequests)) {
+        $batchRequest = new BatchUpdateSpreadsheetRequest(['requests' => $structureRequests]);
+        $service->spreadsheets->batchUpdate($spreadsheetId, $batchRequest);
+    }
+
+    // --- PHASE 3: BATCH SANITIZE & WRITE DATA (2 API CALLS) ---
+    if (!empty($addedStudents)) {
+        
+        // 1. Fetch the newly copied rows in ONE bulk request
+        $minRow = $addedStudents[0]['rowNumber'];
+        $maxRow = $addedStudents[count($addedStudents) - 1]['rowNumber'];
+        $rangeToFetch = "$targetSheetName!$minRow:$maxRow";
+        
+        $getParams = ['valueRenderOption' => 'FORMULA']; 
+        $response = $service->spreadsheets_values->get($spreadsheetId, $rangeToFetch, $getParams);
+        $allFetchedRows = $response->getValues();
+
+        $valueUpdateRequests = [];
+
+        // 2. Clean the data locally in PHP
+        foreach ($addedStudents as $student) {
+            $rowNumber = $student['rowNumber'];
+            $excelName = $student['name'];
+            $arrayIndex = $rowNumber - $minRow; 
+
+            if (isset($allFetchedRows[$arrayIndex])) {
+                $rowData = $allFetchedRows[$arrayIndex];
+                $cleanedData = [];
+
+                foreach ($rowData as $colIndex => $cellValue) {
+                    $cellValue = (string)$cellValue;
+                    
+                    if ($colIndex === 1) {
+                        // Hardcode the student name into Column B (Index 1)
+                        $cleanedData[] = $excelName;
+                    } elseif (substr($cellValue, 0, 1) === '=') {
+                        // Keep formulas
+                        $cleanedData[] = $cellValue;
+                    } else {
+                        // Clear hardcoded data/empty cells
+                        $cleanedData[] = ""; 
+                    }
+                }
+
+                // Ensure the array has the name even if the copied row didn't stretch to Col B
+                if (!isset($cleanedData[1])) {
+                    $cleanedData[1] = $excelName;
+                }
+
+                $valueUpdateRequests[] = new ValueRange([
+                    'range' => "$targetSheetName!A$rowNumber",
+                    'values' => [$cleanedData]
+                ]);
+            }
+        }
+
+        // 3. Write all the cleaned rows back to Google Sheets in ONE bulk update
+        if (!empty($valueUpdateRequests)) {
+            $batchValuesRequest = new \Google\Service\Sheets\BatchUpdateValuesRequest([
+                'valueInputOption' => 'USER_ENTERED',
+                'data' => $valueUpdateRequests
+            ]);
+            $service->spreadsheets_values->batchUpdate($spreadsheetId, $batchValuesRequest);
+        }
+    }
+
     echo "</div>";
     echo "<h3 style='color:green'>Sync Complete!</h3>";
     echo "<a href='index.php'>Go Back</a>";
@@ -138,89 +232,8 @@ try {
 }
 
 // ================= HELPER FUNCTIONS =================
-
-function insertRow($service, $spreadsheetId, $sheetId, $rowIndex) {
-    $request = new BatchUpdateSpreadsheetRequest([
-        'requests' => [
-            'insertDimension' => [
-                'range' => [
-                    'sheetId' => $sheetId,
-                    'dimension' => 'ROWS',
-                    'startIndex' => $rowIndex, 
-                    'endIndex' => $rowIndex + 1
-                ],
-                'inheritFromBefore' => false 
-            ]
-        ]
-    ]);
-    $service->spreadsheets->batchUpdate($spreadsheetId, $request);
-}
-
-function copyFullRow($service, $spreadsheetId, $sheetId, $sourceIndex, $targetIndex) {
-    // We copy PASTE_NORMAL so Google handles the reference updates (C5 becomes C6)
-    $request = new BatchUpdateSpreadsheetRequest([
-        'requests' => [
-            'copyPaste' => [
-                'source' => [
-                    'sheetId' => $sheetId,
-                    'startRowIndex' => $sourceIndex,
-                    'endRowIndex' => $sourceIndex + 1,
-                ],
-                'destination' => [
-                    'sheetId' => $sheetId,
-                    'startRowIndex' => $targetIndex,
-                    'endRowIndex' => $targetIndex + 1,
-                ],
-                'pasteType' => 'PASTE_NORMAL' 
-            ]
-        ]
-    ]);
-    $service->spreadsheets->batchUpdate($spreadsheetId, $request);
-}
-
-function sanitizeRow($service, $spreadsheetId, $sheetName, $rowNumber) {
-    // 1. Read the newly created row (which currently has unwanted copied values)
-    $range = "$sheetName!A$rowNumber:$rowNumber"; // Read whole row
-    $params = ['valueRenderOption' => 'FORMULA']; // IMPORTANT: Get raw formulas
-    
-    $response = $service->spreadsheets_values->get($spreadsheetId, $range, $params);
-    $rowValues = $response->getValues();
-    
-    if (empty($rowValues)) return;
-    
-    $rowData = $rowValues[0];
-    $cleanedData = [];
-
-    // 2. Loop through every cell
-    foreach ($rowData as $cellValue) {
-        $cellValue = (string)$cellValue;
-        
-        // If it starts with '=', it's a formula (like =SUM(C6:Z6)). Keep it!
-        if (substr($cellValue, 0, 1) === '=') {
-            $cleanedData[] = $cellValue;
-        } 
-        // If it's empty, keep it empty.
-        elseif ($cellValue === '') {
-            $cleanedData[] = "";
-        }
-        // If it's a hardcoded value (like "95" or "Present"), DELETE IT.
-        else {
-            $cleanedData[] = ""; 
-        }
-    }
-
-    // 3. Write the cleaned data back
-    $body = new ValueRange(['values' => [$cleanedData]]);
-    $updateParams = ['valueInputOption' => 'USER_ENTERED'];
-    $service->spreadsheets_values->update($spreadsheetId, $range, $body, $updateParams);
-}
-
-function writeCell($service, $spreadsheetId, $sheetName, $rowNumber, $value) {
-    $range = "$sheetName!B$rowNumber";
-    $body = new ValueRange(['values' => [[$value]]]);
-    $params = ['valueInputOption' => 'RAW'];
-    $service->spreadsheets_values->update($spreadsheetId, $range, $body, $params);
-}
+// Note: We deleted insertRow, copyFullRow, sanitizeRow, and writeCell because 
+// we built them directly into the high-speed batch loops above!
 
 function getSheetIdByName($service, $spreadsheetId, $sheetName) {
     $meta = $service->spreadsheets->get($spreadsheetId);
