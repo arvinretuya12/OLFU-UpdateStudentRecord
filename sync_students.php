@@ -8,7 +8,7 @@ use Google\Service\Sheets\BatchUpdateSpreadsheetRequest;
 use Google\Service\Sheets\ValueRange;
 
 // ================= CONFIGURATION =================
-$spreadsheetId = '15zNI8gYqWpOJYVYHW7_f5e4RFGYm54K5JimW_mKK3BU'; // <--- PASTE YOUR ID HERE
+$spreadsheetId = '1cMXTUT--dhMvVuP6AiohfJ5dnZc7mzVk2ioglACMfq8'; // <--- PASTE YOUR ID HERE
 // =================================================
 
 if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
